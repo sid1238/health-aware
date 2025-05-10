@@ -89,3 +89,47 @@ body {
   border-radius: 10px;
   font-size: 0.95em;
 }
+
+.nav-btn {
+  background: none;
+  border: none;
+  color: white;
+  cursor: pointer;
+  margin-left: 20px;
+  font-weight: 500;
+  font-size: 1em;
+}
+
+.nav-btn:hover {
+  text-decoration: underline;
+}
+
+.mission-section {
+  text-align: left;
+  padding-left: 3%;
+  padding-right: 5%;
+  margin-top: 2rem;
+  margin-bottom: 4rem;
+}
+
+.vision-section {
+  text-align: right;
+  padding-right: 3%;
+  padding-left: 5%;
+  margin-top: 2rem;
+  margin-bottom: 4rem;
+}
+
+.vision-section ul {
+  display: inline-block; /* Keep list inline with right-aligned heading */
+  text-align: left;       /* Align list text properly */
+  margin: 0;
+  padding-left: 1.2rem;   /* Normal bullet indent */
+}
+
+.mission-section ul li,
+.vision-section ul li {
+  margin-bottom: 2rem; /* Adds spacing between points */
+  line-height: 1.6;
+  font-size: 1.05rem;
+}
