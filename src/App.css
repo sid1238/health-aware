@@ -229,3 +229,22 @@ html, body {
   font-size: 1rem;
   line-height: 1.6;
 }
+
+.submit-btn {
+  margin-top: 1rem;
+  padding: 0.6rem 1.2rem;
+  background-color: #16a34a;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.response-box {
+  margin-top: 2rem;
+  text-align: left;
+  background-color: #fff;
+  padding: 1rem;
+  border-radius: 8px;
+  color: #111;
+}

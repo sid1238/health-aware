@@ -1,45 +1,66 @@
 import React, { useState } from "react";
+import axios from "axios";
 import "./App.css";
 
 const Help = () => {
   const [query, setQuery] = useState("");
+  const [response, setResponse] = useState("");
 
-  const handleChange = (e) => {
-    setQuery(e.target.value);
+  const handleChange = (e) => setQuery(e.target.value);
+
+  const handleSubmit = async () => {
+    if (!query.trim()) return;
+
+    try {
+      const res = await axios.post("http://localhost:5000/ask", {
+        question: query,
+      });
+      setResponse(res.data.answer);
+    } catch (error) {
+      setResponse("There was an error fetching the answer.");
+    }
   };
 
   return (
-    <div className="help-container">
-      <h2>Need Help?</h2>
-      <p>Enter your query below and we’ll try to assist you:</p>
+    <div className="help-page">
+      <h2>Health Chatbot - Ask a Question</h2>
 
       <input
         type="text"
         value={query}
         onChange={handleChange}
         className="query-input"
-        placeholder="Type your question here..."
+        placeholder="Type your health question here..."
       />
 
+      <button onClick={handleSubmit} className="submit-btn">
+        Ask
+      </button>
+
+      {response && (
+        <div className="response-box">
+          <h3>Answer:</h3>
+          <p>{response}</p>
+        </div>
+      )}
+
       <div className="faq-section">
-        <h3>Frequently Asked Questions</h3>
-        <ul className="faq-list">
-          <li>
-            <strong>1. What is this health chatbot for?</strong><br />
-            Our chatbot helps answer common health-related queries and busts popular myths.
-          </li>
-          <li>
-            <strong>2. Is the chatbot a replacement for a doctor?</strong><br />
-            No, it offers general information and suggestions, but it’s not a substitute for medical advice.
-          </li>
-          <li>
-            <strong>3. Can I use this service for mental health questions?</strong><br />
-            Yes, we cover both physical and mental health awareness and common concerns.
-          </li>
-          <li>
-            <strong>4. How can I contact human support?</strong><br />
-            You can scroll to the footer and use the provided email or phone number.
-          </li>
+        <h2>Frequently Asked Questions</h2>
+        <ul>
+          <li><strong>Q:</strong> How much water should I drink daily?<br />
+              <strong>A:</strong> Generally, 2 to 3 liters per day is recommended depending on your activity level.</li>
+
+          <li><strong>Q:</strong> Can regular exercise help reduce stress?<br />
+              <strong>A:</strong> Yes, physical activity releases endorphins which help improve mood and reduce stress.</li>
+
+          <li><strong>Q:</strong> Are mental health and physical health related?<br />
+              <strong>A:</strong> Absolutely. Poor mental health can lead to physical issues and vice versa.</li>
+
+          <li><strong>Q:</strong> Is 8 hours of sleep necessary for everyone?<br />
+              <strong>A:</strong> Most adults need between 7–9 hours for optimal health and brain function.</li>
+
+          <li><strong>Q:</strong> What are simple ways to stay healthy at home?<br />
+              <strong>A:</strong> Eat a balanced diet, stay active, hydrate well, and get enough rest.</li>
         </ul>
       </div>
     </div>
