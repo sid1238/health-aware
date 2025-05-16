@@ -2,6 +2,7 @@
 
 # dependencies
 backend/rag_env
+backend/models
 /node_modules
 /.pnp
 .pnp.js
