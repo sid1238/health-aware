@@ -12,7 +12,7 @@ CORS(app)
 
 # Load LLM
 llm = Llama(
-    model_path=".backend/models/TinyLlama-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    model_path="./models/TinyLlama-GGUF/TinyLlama-1.1b-chat-v1.0.Q4_K_M.gguf",
     n_ctx=2048,
     n_threads=4,
     temperature=0.7,
