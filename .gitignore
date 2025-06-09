@@ -3,6 +3,8 @@
 # dependencies
 backend/rag_env
 backend/models
+backend/venv
+backend/requirements.txt
 /node_modules
 /.pnp
 .pnp.js

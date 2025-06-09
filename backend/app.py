@@ -7,16 +7,22 @@ import numpy as np
 import requests
 from bs4 import BeautifulSoup
 
+import re
+
 app = Flask(__name__)
 CORS(app)
 
 # Load LLM
-llm = Llama(
-    model_path="./models/TinyLlama-GGUF/TinyLlama-1.1b-chat-v1.0.Q4_K_M.gguf",
-    n_ctx=2048,
-    n_threads=4,
-    temperature=0.7,
-    top_p=0.9
+# llm = Llama(
+#     model_path="./models/TinyLlama-GGUF/TinyLlama-1.1b-chat-v1.0.Q4_K_M.gguf",
+#     n_ctx=2048,
+#     n_threads=4,
+#     temperature=0.7,
+#     top_p=0.9
+# )
+llm = Llama.from_pretrained(
+	repo_id="google/gemma-3-1b-it-qat-q4_0-gguf",
+	filename="gemma-3-1b-it-q4_0.gguf",
 )
 
 # Load embedding model
@@ -84,19 +90,22 @@ def ask():
     try:
         # Step 1: Embed question and search
         q_embed = embedder.encode([user_question])
-        _, I = index.search(np.array(q_embed), k=3)
-        context = "\n".join([all_chunks[i] for i in I[0]])
+        _, I = index.search(np.array(q_embed), k=1)
+        context = "\n".join([all_chunks[i] for i in I[0]])[:200]
 
         # Step 2: Format prompt
-        prompt = f"[INST] Use the following context to answer the question.\n\nContext:\n{context}\n\nQuestion: {user_question} [/INST]"
-
-        # Step 3: Get LLM response
-        result = llm(prompt, max_tokens=512, stop=["</s>"])
-        answer = result["choices"][0]["text"].strip()
-
-        return jsonify({"answer": answer})
+        prompt = f"context:{context}\tAnswer the following question: {user_question}"
+        response = llm.create_chat_completion(
+            messages =[
+                {"role": "user", "content": prompt}
+                ]
+            )
+        
+        
+        return jsonify({"answer": response['choices'][0]['message']['content']})
 
     except Exception as e:
+        print(e)
         return jsonify({"error": str(e)}), 500
 
 # ----------- Run App -----------
