@@ -6,7 +6,7 @@ import faiss
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-
+import json
 import re
 
 app = Flask(__name__)
@@ -40,9 +40,24 @@ def get_text_from_url(url):
         return ""
 
 # Chunk text into manageable pieces
-def split_into_chunks(text, chunk_size=500):
+def split_into_chunks(text, chunk_size=200):
     words = text.split()
     return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+def extract_json(text):
+    import json
+    import re
+
+    # Try to extract JSON block from text
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            return {"error": "Invalid JSON from model"}
+
+    return {"error": "No JSON found"}
 
 # ----------- Load & Prepare Data -----------
 
@@ -88,22 +103,62 @@ def ask():
         return jsonify({"error": "No question provided"}), 400
 
     try:
-        # Step 1: Embed question and search
+        # -------- Step 1: Retrieve Context --------
         q_embed = embedder.encode([user_question])
-        _, I = index.search(np.array(q_embed), k=1)
-        context = "\n".join([all_chunks[i] for i in I[0]])[:200]
+        _, I = index.search(np.array(q_embed), k=3)
+        context = "\n".join([all_chunks[i] for i in I[0]])
 
-        # Step 2: Format prompt
-        prompt = f"context:{context}\tAnswer the following question: {user_question}"
+        # -------- Step 2: Generate Answer --------
+        prompt = (
+            f"You are a helpful health assistant. You will answer without adding any references or links and will not add markdowns.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question:\n{user_question}\n\n"
+            f"Answer:"
+        )
+
         response = llm.create_chat_completion(
-            messages =[
-                {"role": "user", "content": prompt}
-                ]
-            )
-        
-        
-        return jsonify({"answer": response['choices'][0]['message']['content']})
+            messages=[{"role": "user", "content": prompt}]
+        )
 
+        answer = response['choices'][0]['message']['content']
+
+        # -------- Step 3: LLM Evaluation --------
+        eval_prompt = f"""
+You are an evaluation system.
+
+Evaluate the answer.
+
+Question: {user_question}
+Answer: {answer}
+
+Return ONLY valid JSON:
+
+{{
+  "relevance": 1-5,
+  "completeness": 1-5,
+  "fluency": 1-5,
+  "overall": average,
+  "feedback": "short"
+}}
+"""
+
+        eval_response = llm.create_chat_completion(
+            messages=[{"role": "user", "content": eval_prompt}],
+            max_tokens = 120
+        )
+
+        raw_eval = eval_response['choices'][0]['message']['content']
+        evaluation = extract_json(raw_eval)
+
+        if "error" in evaluation: 
+            evaluation = { "relevance": None, 
+                          "completeness": None, 
+                          "fluency": None, 
+                          "overall": None, 
+                          "feedback": "Evaluation failed" } 
+        return jsonify({ "question": user_question, 
+                            "answer": answer, 
+                            "evaluation": evaluation })
     except Exception as e:
         print(e)
         return jsonify({"error": str(e)}), 500
