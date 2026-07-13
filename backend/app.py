@@ -1,3 +1,11 @@
+# Load LLM
+# llm = Llama(
+#     model_path="./models/TinyLlama-GGUF/TinyLlama-1.1b-chat-v1.0.Q4_K_M.gguf",
+#     n_ctx=2048,
+#     n_threads=4,
+#     temperature=0.7,
+#     top_p=0.9
+# )
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from llama_cpp import Llama
@@ -12,14 +20,6 @@ import re
 app = Flask(__name__)
 CORS(app)
 
-# Load LLM
-# llm = Llama(
-#     model_path="./models/TinyLlama-GGUF/TinyLlama-1.1b-chat-v1.0.Q4_K_M.gguf",
-#     n_ctx=2048,
-#     n_threads=4,
-#     temperature=0.7,
-#     top_p=0.9
-# )
 llm = Llama.from_pretrained(
 	repo_id="google/gemma-3-1b-it-qat-q4_0-gguf",
 	filename="gemma-3-1b-it-q4_0.gguf",
@@ -43,6 +43,10 @@ def get_text_from_url(url):
 def split_into_chunks(text, chunk_size=200):
     words = text.split()
     return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+
+def limit_text(text, max_words=200):
+    words = text.split()
+    return " ".join(words[:max_words])
 
 def extract_json(text):
     import json
@@ -107,13 +111,20 @@ def ask():
         q_embed = embedder.encode([user_question])
         _, I = index.search(np.array(q_embed), k=3)
         context = "\n".join([all_chunks[i] for i in I[0]])
+        #retrieved_chunks = [all_chunks[i] for i in I[0]]
+
+        #context = " ".join(retrieved_chunks)
+
+        # 🔽 Limit total context size
+        #context = limit_text(context, max_words=200)
 
         # -------- Step 2: Generate Answer --------
         prompt = (
-            f"You are a helpful health assistant. You will answer without adding any references or links and will not add markdowns.\n\n"
+            f"You are a helpful health assistant.\n\n"
             f"Context:\n{context}\n\n"
             f"Question:\n{user_question}\n\n"
-            f"Answer:"
+            f"Answer:\n\n"
+            f"You will answer without adding any references or links and will not add markdowns"
         )
 
         response = llm.create_chat_completion(
