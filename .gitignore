@@ -5,6 +5,7 @@ backend/rag_env
 backend/models
 backend/venv
 backend/requirements.txt
+backend/rag_cache
 /node_modules
 /.pnp
 .pnp.js

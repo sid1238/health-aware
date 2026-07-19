@@ -8,6 +8,8 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import re
+import os
+import hashlib
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +30,17 @@ embedder = SentenceTransformer("all-MiniLM-L6-v2")
 HEADERS = {
     "User-Agent": "HealthChatbotProject/1.0 (contact: youremail@example.com)"
 }
+
+# ----------- Persistence config -----------
+# Where the built FAISS index and chunk metadata get cached on disk so we don't
+# re-scrape all 21 URLs and re-embed everything on every single restart.
+
+CACHE_DIR = "rag_cache"
+INDEX_PATH = os.path.join(CACHE_DIR, "faiss.index")
+CHUNKS_PATH = os.path.join(CACHE_DIR, "chunks.json")
+SOURCES_HASH_PATH = os.path.join(CACHE_DIR, "sources.hash")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ----------- Text acquisition & cleaning -----------
 
@@ -112,10 +125,42 @@ def extract_json(text):
 
 
 # ----------- Load & Prepare Data -----------
+# Expanded corpus covering the categories users are most likely to ask about:
+# chronic diseases, common symptoms/acute conditions, medications, nutrition,
+# and mental health. Add/remove URLs here as you learn what your users ask about.
 
 wiki_urls = [
+    # Chronic diseases
     "https://en.wikipedia.org/wiki/Cancer",
     "https://en.wikipedia.org/wiki/Diabetes",
+    "https://en.wikipedia.org/wiki/Hypertension",
+    "https://en.wikipedia.org/wiki/Asthma",
+    "https://en.wikipedia.org/wiki/Obesity",
+    "https://en.wikipedia.org/wiki/Chronic_kidney_disease",
+
+    # Common symptoms / acute conditions
+    "https://en.wikipedia.org/wiki/Common_cold",
+    "https://en.wikipedia.org/wiki/Influenza",
+    "https://en.wikipedia.org/wiki/Migraine",
+    "https://en.wikipedia.org/wiki/Fever",
+    "https://en.wikipedia.org/wiki/Gastroenteritis",
+
+    # Medications
+    "https://en.wikipedia.org/wiki/Paracetamol",
+    "https://en.wikipedia.org/wiki/Ibuprofen",
+    "https://en.wikipedia.org/wiki/Antibiotic",
+    "https://en.wikipedia.org/wiki/Insulin_(medication)",
+
+    # Nutrition
+    "https://en.wikipedia.org/wiki/Nutrition",
+    "https://en.wikipedia.org/wiki/Vitamin_D",
+    "https://en.wikipedia.org/wiki/Dietary_fiber",
+
+    # Mental health
+    "https://en.wikipedia.org/wiki/Major_depressive_disorder",
+    "https://en.wikipedia.org/wiki/Anxiety_disorder",
+    "https://en.wikipedia.org/wiki/Sleep",
+    "https://en.wikipedia.org/wiki/Stress_(biology)",
 ]
 
 custom_sentences = [
@@ -125,38 +170,92 @@ custom_sentences = [
     "A diet rich in fruits and vegetables supports a healthy immune system.",
 ]
 
-all_chunks = []
+def get_sources_fingerprint():
+    """Hash of the current source list. If wiki_urls or custom_sentences change,
+    this hash changes too, which tells load_or_build_index() the cache is stale
+    and needs to be rebuilt instead of silently serving outdated content."""
+    raw = "|".join(wiki_urls) + "|" + "|".join(custom_sentences)
+    return hashlib.sha256(raw.encode()).hexdigest()
 
-print("\n--- Building corpus ---")
-for url in wiki_urls:
-    text = get_text_from_url(url)
-    if not text:
-        print(f"[SKIP] {url} produced no usable text.")
-        continue
-    chunks = chunk_by_sentences(text)
-    print(f"[OK] {url} -> {len(chunks)} chunks, {len(text.split())} words")
-    for chunk in chunks:
-        all_chunks.append({"text": chunk, "source": url})
 
-custom_text = " ".join(custom_sentences)
-custom_chunks = chunk_by_sentences(custom_text, target_words=50, overlap_sentences=1)
-print(f"[OK] custom_health_tips -> {len(custom_chunks)} chunks")
-for chunk in custom_chunks:
-    all_chunks.append({"text": chunk, "source": "custom_health_tips"})
+def build_corpus():
+    """Scrape, clean, and chunk every source. Returns a list of
+    {"text": ..., "source": ...} dicts. This is only called when there's no
+    valid cache on disk."""
+    all_chunks = []
 
-print(f"--- Total chunks indexed: {len(all_chunks)} ---\n")
+    print("\n--- Building corpus (scraping + chunking) ---")
+    for url in wiki_urls:
+        text = get_text_from_url(url)
+        if not text:
+            print(f"[SKIP] {url} produced no usable text.")
+            continue
+        chunks = chunk_by_sentences(text)
+        print(f"[OK] {url} -> {len(chunks)} chunks, {len(text.split())} words")
+        for chunk in chunks:
+            all_chunks.append({"text": chunk, "source": url})
 
-if len(all_chunks) <= len(custom_chunks):
-    print("*** WARNING: none of the Wikipedia URLs produced content. "
-          "Your corpus is effectively just the 4 custom sentences. "
-          "Check the [WARN]/[ERROR] messages above. ***\n")
+    custom_text = " ".join(custom_sentences)
+    custom_chunks = chunk_by_sentences(custom_text, target_words=50, overlap_sentences=1)
+    print(f"[OK] custom_health_tips -> {len(custom_chunks)} chunks")
+    for chunk in custom_chunks:
+        all_chunks.append({"text": chunk, "source": "custom_health_tips"})
 
-chunk_texts = [c["text"] for c in all_chunks]
-embeddings = embedder.encode(chunk_texts, normalize_embeddings=True)
-embeddings = np.array(embeddings).astype("float32")
+    print(f"--- Total chunks built: {len(all_chunks)} ---\n")
 
-index = faiss.IndexFlatIP(embeddings.shape[1])
-index.add(embeddings)
+    if len(all_chunks) <= len(custom_chunks):
+        print("*** WARNING: none of the Wikipedia URLs produced content. "
+              "Your corpus is effectively just the 4 custom sentences. "
+              "Check the [WARN]/[ERROR] messages above. ***\n")
+
+    return all_chunks
+
+
+def load_or_build_index():
+    """Load the FAISS index + chunk metadata from disk if a valid cache exists
+    for the current source list; otherwise scrape/embed fresh and cache the
+    result so the next restart can skip straight to loading."""
+    current_hash = get_sources_fingerprint()
+
+    cache_valid = (
+        os.path.exists(INDEX_PATH)
+        and os.path.exists(CHUNKS_PATH)
+        and os.path.exists(SOURCES_HASH_PATH)
+    )
+
+    if cache_valid:
+        with open(SOURCES_HASH_PATH, "r") as f:
+            cached_hash = f.read().strip()
+        if cached_hash == current_hash:
+            print("--- Loading cached FAISS index and chunks from disk ---")
+            cached_index = faiss.read_index(INDEX_PATH)
+            with open(CHUNKS_PATH, "r") as f:
+                cached_chunks = json.load(f)
+            print(f"--- Loaded {len(cached_chunks)} chunks from cache ---\n")
+            return cached_index, cached_chunks
+        else:
+            print("--- Source list changed since last run — rebuilding index ---")
+
+    chunks = build_corpus()
+    chunk_texts = [c["text"] for c in chunks]
+    embeddings = embedder.encode(chunk_texts, normalize_embeddings=True)
+    embeddings = np.array(embeddings).astype("float32")
+
+    new_index = faiss.IndexFlatIP(embeddings.shape[1])
+    new_index.add(embeddings)
+
+    # Persist to disk so the next startup can skip scraping + embedding entirely
+    faiss.write_index(new_index, INDEX_PATH)
+    with open(CHUNKS_PATH, "w") as f:
+        json.dump(chunks, f)
+    with open(SOURCES_HASH_PATH, "w") as f:
+        f.write(current_hash)
+
+    print(f"--- Cached index + chunks to '{CACHE_DIR}/' for future restarts ---\n")
+    return new_index, chunks
+
+
+index, all_chunks = load_or_build_index()
 
 # Lowered from 0.35 — all-MiniLM-L6-v2 is a general-purpose symmetric similarity
 # model, not tuned for question-vs-passage retrieval, so genuine matches often
@@ -306,5 +405,19 @@ Return ONLY valid JSON:
         return jsonify({"error": str(e)}), 500
 
 
+# ----------- Force a cache rebuild -----------
+# Run `python health_chatbot.py --rebuild` to wipe the cache and re-scrape
+# everything from scratch — useful if a source's content has changed on the
+# web even though your wiki_urls list hasn't, since the hash check alone
+# wouldn't catch that.
+
 if __name__ == "__main__":
+    import sys
+    if "--rebuild" in sys.argv:
+        for path in [INDEX_PATH, CHUNKS_PATH, SOURCES_HASH_PATH]:
+            if os.path.exists(path):
+                os.remove(path)
+        print("--- Cache cleared, rebuilding now ---")
+        index, all_chunks = load_or_build_index()
+
     app.run(debug=True)
