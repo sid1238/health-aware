@@ -60,7 +60,7 @@ def run_eval():
         else:
             failed += 1
 
-        top_score = matches_above_threshold[0]["score"] if matches_above_threshold else None
+        top_score = matches_above_threshold[0]["combined_score"] if matches_above_threshold else None
 
         results.append({
             "id": q["id"],

@@ -10,6 +10,7 @@ import json
 import re
 import os
 import hashlib
+from rank_bm25 import BM25Okapi
 
 app = Flask(__name__)
 CORS(app)
@@ -112,6 +113,14 @@ def truncate_to_word_budget(text, max_words=220):
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words]) + " ..."
+
+
+def tokenize(text):
+    """Simple lowercase word tokenizer for BM25. Deliberately basic (no
+    stemming/lemmatization) — BM25 matches on exact tokens, which is exactly
+    what we want it to complement embeddings with: exact drug names, dosage
+    numbers, and specific terms that semantic search can blur past."""
+    return re.findall(r"[a-z0-9]+", text.lower())
 
 
 def extract_json(text):
@@ -257,11 +266,86 @@ def load_or_build_index():
 
 index, all_chunks = load_or_build_index()
 
+# ----------- Keyword (BM25) index -----------
+# Built fresh every startup regardless of whether the FAISS index was loaded
+# from cache — tokenizing the corpus is cheap, so there's no need to persist
+# this separately.
+
+print("--- Building BM25 keyword index ---")
+tokenized_corpus = [tokenize(c["text"]) for c in all_chunks]
+bm25 = BM25Okapi(tokenized_corpus)
+print(f"--- BM25 index built over {len(all_chunks)} chunks ---\n")
+
 # Lowered from 0.35 — all-MiniLM-L6-v2 is a general-purpose symmetric similarity
 # model, not tuned for question-vs-passage retrieval, so genuine matches often
 # score in the 0.15-0.30 range. Use the /debug endpoint below to see real scores
-# for your own questions and adjust this number accordingly.
+# for your own questions and adjust this number accordingly. Note this now
+# applies to the COMBINED hybrid score, not raw cosine similarity — recheck it
+# after switching to hybrid_search().
 RELEVANCE_THRESHOLD = 0.15
+
+# Weight given to semantic (embedding) score vs keyword (BM25) score when
+# combining. 0.6 means 60% semantic, 40% keyword. Semantic search is generally
+# better at understanding paraphrased/conceptual questions, while BM25 is
+# better at exact terms (drug names, specific numbers/dosages) that embeddings
+# can blur past — so this is a starting point, not a fixed answer. Tune it
+# using /debug: if BM25-favoring matches (exact term hits) are getting buried
+# by semantically-similar-but-wrong chunks, lower this; if keyword noise is
+# winning over genuinely relevant chunks, raise it.
+SEMANTIC_WEIGHT = 0.6
+
+
+def hybrid_search(question, k=3, candidate_pool=20):
+    """
+    Combines semantic (embedding/FAISS) search with keyword (BM25) search.
+
+    Why: pure semantic search can miss questions that hinge on an exact term —
+    a specific drug name, a dosage number, a precise medical term — because
+    the embedding model cares about overall meaning, not exact tokens. BM25
+    is the opposite: it's strong on exact term overlap but has no notion of
+    meaning, so it misses paraphrased questions. Combining both catches more
+    of both cases than either alone.
+
+    Returns the top-k combined results, plus the full candidate pool (used by
+    /debug to show the score breakdown for tuning SEMANTIC_WEIGHT/threshold).
+    """
+    pool = min(candidate_pool, len(all_chunks))
+
+    # --- Semantic candidates ---
+    q_embed = embedder.encode([question], normalize_embeddings=True)
+    q_embed = np.array(q_embed).astype("float32")
+    sem_scores, sem_idxs = index.search(q_embed, pool)
+    sem_scores, sem_idxs = sem_scores[0], sem_idxs[0]
+    semantic_score_map = {int(i): float(s) for i, s in zip(sem_idxs, sem_scores)}
+
+    # --- Keyword (BM25) candidates ---
+    tokenized_query = tokenize(question)
+    bm25_scores = bm25.get_scores(tokenized_query)  # one score per chunk in the corpus
+    max_bm25 = float(np.max(bm25_scores)) if len(bm25_scores) else 0.0
+    # Normalize BM25 scores to roughly [0, 1] so they're comparable to cosine
+    # similarity. BM25 scores are unbounded and query-dependent, so this is a
+    # per-query max-normalization rather than a fixed global scale.
+    bm25_norm = bm25_scores / max_bm25 if max_bm25 > 0 else bm25_scores
+    bm25_top_idxs = np.argsort(bm25_scores)[-pool:][::-1]
+
+    # --- Combine ---
+    candidate_indices = set(semantic_score_map.keys()) | set(int(i) for i in bm25_top_idxs)
+
+    combined = []
+    for i in candidate_indices:
+        sem_s = semantic_score_map.get(i, 0.0)
+        bm25_s = float(bm25_norm[i])
+        combined_score = SEMANTIC_WEIGHT * sem_s + (1 - SEMANTIC_WEIGHT) * bm25_s
+        combined.append({
+            "index": i,
+            "semantic_score": sem_s,
+            "bm25_score": bm25_s,
+            "combined_score": combined_score,
+        })
+
+    combined.sort(key=lambda x: x["combined_score"], reverse=True)
+    return combined[:k], combined
+
 
 # ----------- Debug endpoint -----------
 # Hit this with the same question that's failing to see the ACTUAL similarity
@@ -276,27 +360,25 @@ def debug():
     if not user_question:
         return jsonify({"error": "No question provided"}), 400
 
-    q_embed = embedder.encode([user_question], normalize_embeddings=True)
-    q_embed = np.array(q_embed).astype("float32")
-
-    k = 5
-    scores, idxs = index.search(q_embed, k)
-    scores, idxs = scores[0], idxs[0]
+    top_k, all_candidates = hybrid_search(user_question, k=5, candidate_pool=20)
 
     results = [
         {
-            "score": float(score),
-            "source": all_chunks[i]["source"],
-            "text_preview": all_chunks[i]["text"][:200],
-            "passes_current_threshold": float(score) >= RELEVANCE_THRESHOLD,
+            "combined_score": round(c["combined_score"], 4),
+            "semantic_score": round(c["semantic_score"], 4),
+            "bm25_score": round(c["bm25_score"], 4),
+            "source": all_chunks[c["index"]]["source"],
+            "text_preview": all_chunks[c["index"]]["text"][:200],
+            "passes_current_threshold": c["combined_score"] >= RELEVANCE_THRESHOLD,
         }
-        for i, score in zip(idxs, scores)
+        for c in top_k
     ]
 
     return jsonify({
         "question": user_question,
         "total_chunks_in_index": len(all_chunks),
         "current_threshold": RELEVANCE_THRESHOLD,
+        "semantic_weight": SEMANTIC_WEIGHT,
         "top_matches": results,
     })
 
@@ -312,17 +394,12 @@ def ask():
         return jsonify({"error": "No question provided"}), 400
 
     try:
-        q_embed = embedder.encode([user_question], normalize_embeddings=True)
-        q_embed = np.array(q_embed).astype("float32")
-
-        k = 3
-        scores, idxs = index.search(q_embed, k)
-        scores, idxs = scores[0], idxs[0]
+        top_k, _ = hybrid_search(user_question, k=3, candidate_pool=20)
 
         retrieved = [
-            (all_chunks[i], float(score))
-            for i, score in zip(idxs, scores)
-            if score >= RELEVANCE_THRESHOLD
+            (all_chunks[c["index"]], c["combined_score"])
+            for c in top_k
+            if c["combined_score"] >= RELEVANCE_THRESHOLD
         ]
 
         if not retrieved:
