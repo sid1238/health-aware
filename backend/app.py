@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from llama_cpp import Llama
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 import faiss
 import numpy as np
 import requests
@@ -16,6 +16,7 @@ import shutil
 import sys
 import threading
 import time
+import torch
 from rank_bm25 import BM25Okapi
 
 app = Flask(__name__)
@@ -24,6 +25,7 @@ CORS(app)
 # The LLM is loaded on the first /ask rather than at import. Only /ask needs it,
 # so /debug, run_eval.py and index rebuilds stay fast, and Flask's debug reloader
 # no longer holds a second copy of the model in its parent process.
+GENERATOR_MODEL = "gemma-3-1b-it-q4_0.gguf"
 _llm = None
 _llm_lock = threading.Lock()  # llama.cpp contexts aren't safe for concurrent calls
 
@@ -35,7 +37,7 @@ def get_llm():
         print("--- Loading LLM (first question only) ---")
         _llm = Llama.from_pretrained(
             repo_id="google/gemma-3-1b-it-qat-q4_0-gguf",
-            filename="gemma-3-1b-it-q4_0.gguf",
+            filename=GENERATOR_MODEL,
             n_ctx=2048,       # default is only 512 — too small once context + prompt + answer are combined
             n_batch=512,      # can leave as-is; only relevant to prompt-processing speed
         )
@@ -45,6 +47,12 @@ def get_llm():
 # Load embedding model
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 embedder = SentenceTransformer(EMBEDDING_MODEL)
+
+# Reads the question and a passage together, so it's far better at judging "does
+# this passage answer this question" than comparing two separate embeddings, but
+# too slow to run over the whole corpus. See retrieve().
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+reranker = CrossEncoder(RERANKER_MODEL)
 
 # Wikimedia will often return 403 for requests without a proper User-Agent.
 # This was silently swallowed before (the except block just returned ""),
@@ -260,16 +268,6 @@ def tokenize(text):
     what we want it to complement embeddings with: exact drug names, dosage
     numbers, and specific terms that semantic search can blur past."""
     return re.findall(r"[a-z0-9]+", text.lower())
-
-
-def extract_json(text):
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            return {"error": "Invalid JSON from model"}
-    return {"error": "No JSON found"}
 
 
 # ----------- Load & Prepare Data -----------
@@ -506,13 +504,17 @@ tokenized_corpus = [tokenize(indexable_text(c)) for c in all_chunks]
 bm25 = BM25Okapi(tokenized_corpus)
 print(f"--- BM25 index built over {len(all_chunks)} chunks ---\n")
 
-# Lowered from 0.35 — all-MiniLM-L6-v2 is a general-purpose symmetric similarity
-# model, not tuned for question-vs-passage retrieval, so genuine matches often
-# score in the 0.15-0.30 range. Use the /debug endpoint below to see real scores
-# for your own questions and adjust this number accordingly. Note this now
-# applies to the COMBINED hybrid score, not raw cosine similarity — recheck it
-# after switching to hybrid_search().
-RELEVANCE_THRESHOLD = 0.15
+# The fallback fires when the BEST reranked chunk scores below this (raw
+# cross-encoder logit). It's deliberately loose: on eval_questions.json, -4 rejects
+# none of the 43 in-scope questions and catches the question with no real match
+# (broken bones, -5.32), but that rests on very few examples, so recheck it with
+# /debug as the corpus grows. Questions that do match the text, like asking for a
+# chemotherapy dose, score as relevant and can't be caught by any cutoff here.
+RELEVANCE_THRESHOLD = -4.0
+
+# How many hybrid candidates the cross-encoder re-scores. On the eval set, 10 found
+# as many right pages as 20 or 40 at a quarter of the cost or less (~0.7s/query on CPU).
+RERANK_CANDIDATES = 10
 
 # Weight given to semantic (embedding) score vs keyword (BM25) score when
 # combining. 0.6 means 60% semantic, 40% keyword. Semantic search is generally
@@ -583,6 +585,35 @@ def hybrid_search(question, k=TOP_K, candidate_pool=20):
     return combined[:k], combined
 
 
+def retrieve(question, k=TOP_K, rerank=True):
+    """Two-stage retrieval: hybrid search casts a wide net, then the cross-encoder
+    picks the best chunks from it. Returns (top_k_candidates, is_confident), where
+    is_confident is False when even the best chunk looks unrelated to the question.
+
+    The cross-encoder scores plain chunk text, without the title/section prefix used
+    by search: with the prefix it found fewer right pages on the eval set (41 vs 43
+    of 43 in the top 2).
+
+    rerank=False gives the hybrid-only pipeline so judge_eval.py can compare the two.
+    Its combined scores have no usable cutoff, so it's always "confident".
+    """
+    candidates, _ = hybrid_search(question, k=RERANK_CANDIDATES)
+    if not rerank:
+        return candidates[:k], True
+
+    scores = reranker.predict(
+        [(question, all_chunks[c["index"]]["text"]) for c in candidates],
+        activation_fn=torch.nn.Identity(),  # raw logits, so the threshold has a fixed scale
+        show_progress_bar=False,
+    )
+    for c, score in zip(candidates, scores):
+        c["rerank_score"] = float(score)
+    candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
+    # Gate on the best chunk only. A weaker second chunk can still hold the answer:
+    # the Tylenol question's Paracetamol chunk scores below the threshold.
+    return candidates[:k], candidates[0]["rerank_score"] >= RELEVANCE_THRESHOLD
+
+
 # ----------- Debug endpoint -----------
 # Hit this with the same question that's failing to see the ACTUAL similarity
 # scores being returned, before any threshold is applied. This tells you whether
@@ -596,19 +627,20 @@ def debug():
     if not user_question:
         return jsonify({"error": "No question provided"}), 400
 
-    top_k, all_candidates = hybrid_search(user_question, k=5, candidate_pool=20)
+    top_k, is_confident = retrieve(user_question, k=5)
 
     results = [
         {
             "rank": rank,
             "used_by_ask": rank <= TOP_K,
+            "rerank_score": round(c["rerank_score"], 4),
             "combined_score": round(c["combined_score"], 4),
             "semantic_score": round(c["semantic_score"], 4),
             "bm25_score": round(c["bm25_score"], 4),
             "source": all_chunks[c["index"]]["source"],
             "section": all_chunks[c["index"]]["section"],
             "text_preview": all_chunks[c["index"]]["text"][:200],
-            "passes_current_threshold": c["combined_score"] >= RELEVANCE_THRESHOLD,
+            "passes_current_threshold": is_confident,
         }
         for rank, c in enumerate(top_k, start=1)
     ]
@@ -643,30 +675,26 @@ def ask():
     if not user_question:
         return jsonify({"error": "No question provided"}), 400
 
+    # rerank and include_context exist for judge_eval.py, which compares pipelines
+    # and needs the exact context behind each answer to check it for hallucination.
+    use_reranker = data.get("rerank", True)
+    include_context = data.get("include_context", False)
+
     try:
-        top_k, _ = hybrid_search(user_question, candidate_pool=20)
+        top_k, is_confident = retrieve(user_question, rerank=use_reranker)
 
-        retrieved = [
-            (all_chunks[c["index"]], c["combined_score"])
-            for c in top_k
-            if c["combined_score"] >= RELEVANCE_THRESHOLD
-        ]
-
-        if not retrieved:
+        if not is_confident:
             answer = (
                 "I don't have enough reliable information in my current sources "
                 "to answer that confidently. Please consult a healthcare "
                 "professional or rephrase your question."
             )
-            return jsonify({
-                "question": user_question,
-                "answer": answer,
-                "evaluation": {
-                    "relevance": None, "completeness": None, "fluency": None,
-                    "overall": None, "feedback": "No relevant context retrieved"
-                },
-                "sources": [],
-            })
+            result = {"question": user_question, "answer": answer, "sources": []}
+            if include_context:
+                result["context"] = ""
+            return jsonify(result)
+
+        retrieved = [(all_chunks[c["index"]], c) for c in top_k]
 
         context = "\n\n".join(f"[{c['title']}] {c['text']}" for c, _ in retrieved)
         context = truncate_to_word_budget(context)
@@ -692,45 +720,14 @@ def ask():
 
         answer = response["choices"][0]["message"]["content"]
 
-        eval_prompt = f"""You are an evaluation system.
-
-Evaluate the answer.
-
-Question: {user_question}
-Answer: {answer}
-
-Return ONLY valid JSON:
-
-{{
-  "relevance": 1-5,
-  "completeness": 1-5,
-  "fluency": 1-5,
-  "overall": average,
-  "feedback": "short"
-}}
-"""
-
-        with _llm_lock:
-            eval_response = llm.create_chat_completion(
-                messages=[{"role": "user", "content": eval_prompt}],
-                max_tokens=120,
-            )
-
-        raw_eval = eval_response["choices"][0]["message"]["content"]
-        evaluation = extract_json(raw_eval)
-
-        if "error" in evaluation:
-            evaluation = {
-                "relevance": None, "completeness": None, "fluency": None,
-                "overall": None, "feedback": "Evaluation failed"
-            }
-
-        return jsonify({
+        result = {
             "question": user_question,
             "answer": answer,
-            "evaluation": evaluation,
             "sources": unique_sources(c for c, _ in retrieved),
-        })
+        }
+        if include_context:
+            result["context"] = context
+        return jsonify(result)
     except Exception as e:
         print(e)
         return jsonify({"error": str(e)}), 500

@@ -72,7 +72,7 @@ def run_eval():
             passed += 1
             by_topic[q["topic"]][0] += 1
 
-        top_score = used_by_ask[0]["combined_score"] if used_by_ask else None
+        top_score = used_by_ask[0]["rerank_score"] if used_by_ask else None
 
         results.append({
             "id": q["id"],
