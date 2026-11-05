@@ -6,6 +6,8 @@ backend/models
 backend/venv
 backend/requirements.txt
 backend/rag_cache
+backend/eval_results.json
+__pycache__/
 /node_modules
 /.pnp
 .pnp.js

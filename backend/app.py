@@ -6,24 +6,45 @@ import faiss
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+import inspect
 import json
 import re
 import os
 import hashlib
+import shutil
+import sys
+import threading
+import time
 from rank_bm25 import BM25Okapi
 
 app = Flask(__name__)
 CORS(app)
 
-llm = Llama.from_pretrained(
-    repo_id="google/gemma-3-1b-it-qat-q4_0-gguf",
-    filename="gemma-3-1b-it-q4_0.gguf",
-    n_ctx=2048,       # default is only 512 — too small once context + prompt + answer are combined
-    n_batch=512,      # can leave as-is; only relevant to prompt-processing speed
-)
+# The LLM is loaded on the first /ask rather than at import. Only /ask needs it,
+# so /debug, run_eval.py and index rebuilds stay fast, and Flask's debug reloader
+# no longer holds a second copy of the model in its parent process.
+_llm = None
+_llm_lock = threading.Lock()  # llama.cpp contexts aren't safe for concurrent calls
+
+
+def get_llm():
+    """Must be called with _llm_lock held."""
+    global _llm
+    if _llm is None:
+        print("--- Loading LLM (first question only) ---")
+        _llm = Llama.from_pretrained(
+            repo_id="google/gemma-3-1b-it-qat-q4_0-gguf",
+            filename="gemma-3-1b-it-q4_0.gguf",
+            n_ctx=2048,       # default is only 512 — too small once context + prompt + answer are combined
+            n_batch=512,      # can leave as-is; only relevant to prompt-processing speed
+        )
+    return _llm
+
 
 # Load embedding model
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+embedder = SentenceTransformer(EMBEDDING_MODEL)
 
 # Wikimedia will often return 403 for requests without a proper User-Agent.
 # This was silently swallowed before (the except block just returned ""),
@@ -34,80 +55,198 @@ HEADERS = {
 
 # ----------- Persistence config -----------
 # Where the built FAISS index and chunk metadata get cached on disk so we don't
-# re-scrape all 21 URLs and re-embed everything on every single restart.
+# re-scrape every URL and re-embed everything on every single restart.
+# Anchored to this file so the cache is found whatever directory you start from.
 
-CACHE_DIR = "rag_cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_cache")
 INDEX_PATH = os.path.join(CACHE_DIR, "faiss.index")
 CHUNKS_PATH = os.path.join(CACHE_DIR, "chunks.json")
-SOURCES_HASH_PATH = os.path.join(CACHE_DIR, "sources.hash")
+MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
+# Raw pages are kept separately so tuning the cleaning/chunking code re-embeds
+# without re-downloading anything.
+HTML_DIR = os.path.join(CACHE_DIR, "html")
 
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(HTML_DIR, exist_ok=True)
 
 # ----------- Text acquisition & cleaning -----------
 
-def get_text_from_url(url):
-    """Fetch and clean the main body text of a Wikipedia (or similar) article."""
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200:
+def fetch_html(url, retries=3):
+    """Return a page's HTML from the on-disk cache, or download and cache it.
+    Returns None if it can't be fetched. Transient failures (rate limiting,
+    server errors, timeouts) are retried with a growing delay."""
+    path = os.path.join(HTML_DIR, hashlib.sha256(url.encode()).hexdigest()[:16] + ".html")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=20)
+            if response.status_code == 200:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(response.text)
+                time.sleep(0.5)  # be polite to Wikipedia during a full scrape
+                return response.text
             print(f"[WARN] {url} returned status {response.status_code}")
-            return ""
+            if response.status_code != 429 and response.status_code < 500:
+                return None
+        except requests.RequestException as e:
+            print(f"[WARN] Exception fetching {url}: {e}")
+        time.sleep(2 ** attempt)
+    return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
 
-        for tag in soup.find_all(["table", "sup", "style", "script"]):
+# Page furniture that isn't article prose.
+NOISE_SELECTORS = [
+    "table", "sup", "style", "script", "cite", "figure", "img",
+    ".navbox", ".vertical-navbox", ".sidebar", ".infobox", ".hatnote",
+    ".thumb", ".metadata", ".ambox", ".reflist", ".refbegin", ".gallery",
+    ".mw-editsection", ".mw-empty-elt", ".shortdescription", ".noprint",
+    ".portalbox", ".side-box", ".toc",
+]
+
+# Trailing sections that are lists of links and citations, not health content.
+SKIPPED_SECTIONS = {
+    "references", "see also", "external links", "further reading", "notes",
+    "bibliography", "sources", "footnotes", "citations", "explanatory notes",
+    "general bibliography", "gallery",
+}
+
+
+def extract_article(html):
+    """Split an article into {"title": ..., "sections": [(name, text), ...]}.
+
+    Lists are kept alongside paragraphs: symptom lists, diagnostic criteria and
+    risk factors are often written as bullets, and scraping only <p> tags left
+    chunks ending in "the following criteria must be met:" with nothing after.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    heading = soup.find("h1", {"id": "firstHeading"})
+    title = heading.get_text(strip=True) if heading else ""
+
+    root = soup.select_one("#mw-content-text .mw-parser-output") \
+        or soup.find("div", {"id": "mw-content-text"}) or soup
+
+    # Keep formulas readable as plain text instead of duplicated LaTeX markup.
+    for math in root.select(".mwe-math-element"):
+        node = math.find("math")
+        alt = node.get("alttext", "") if node else ""
+        math.replace_with(re.sub(r"\\displaystyle\s*", "", alt).strip("{} "))
+
+    for selector in NOISE_SELECTORS:
+        for tag in root.select(selector):
             tag.decompose()
 
-        content = soup.find("div", {"id": "mw-content-text"}) or soup
-        paragraphs = content.find_all("p")
-        text = "\n".join(p.get_text() for p in paragraphs if p.get_text().strip())
+    sections = []
+    top_heading, name, parts = "", "Overview", []
+    skipping = False
 
-        cleaned = clean_text(text)
-        if not cleaned:
-            print(f"[WARN] {url} returned 200 but no paragraph text was extracted")
-        return cleaned
-    except Exception as e:
-        print(f"[ERROR] Exception fetching {url}: {e}")
-        return ""
+    for el in root.find_all(["h2", "h3", "p", "ul", "ol"]):
+        if el.name in ("h2", "h3"):
+            text = clean_text(" ".join(parts))
+            if text:
+                sections.append((name, text))
+            parts = []
+            heading_text = clean_text(el.get_text())
+            if el.name == "h2":
+                top_heading = heading_text
+                name = heading_text
+                skipping = heading_text.lower() in SKIPPED_SECTIONS
+            else:
+                name = f"{top_heading}: {heading_text}" if top_heading else heading_text
+        elif skipping:
+            continue
+        elif el.name == "p":
+            text = el.get_text(" ", strip=True)
+            if len(text.split()) >= 4:
+                parts.append(text)
+        else:
+            # Deepest items first, removing each one, so a parent item doesn't
+            # repeat the text of the sub-list nested inside it.
+            items = []
+            for li in reversed(el.find_all("li")):
+                item = clean_text(li.get_text(" ", strip=True))
+                li.decompose()
+                if item:
+                    items.append(item if item[-1] in ".!?:" else item + ".")
+            parts.extend(reversed(items))
+
+    text = clean_text(" ".join(parts))
+    if text and not skipping:
+        sections.append((name, text))
+
+    return {"title": title, "sections": sections}
 
 
 def clean_text(text):
-    text = re.sub(r"\[\d+\]", "", text)
-    text = re.sub(r"\[edit\]", "", text)
+    text = re.sub(r"\[\s*(?:\d+|[a-z]|edit|citation needed|note \d+|nb \d+)\s*\]", "", text, flags=re.I)
+    # Bibliography identifiers that survive inside body paragraphs.
+    text = re.sub(r"\bdoi:\s*\S+", "", text)
+    text = re.sub(r"\b(?:PMC|PMID|ISBN)[ :]*[\dX-]+\.?", "", text)
     text = re.sub(r"\s+", " ", text)
+    # get_text(" ") and removed citations leave gaps before punctuation and inside brackets.
+    text = re.sub(r"\s+([,.;:!?)\]])", r"\1", text)
+    text = re.sub(r"([(\[])\s+", r"\1", text)
     return text.strip()
 
 
+# Periods here don't end a sentence. Case-sensitive, so "No." and "So." still do.
+SENTENCE_ABBREVIATIONS = r"\b(?:e\.g|i\.e|et al|etc|vs|cf|ca|approx|Dr|Mr|Mrs|Ms|Prof|St|Fig)\."
+SENTENCE_BOUNDARY = r"(?<=[.!?])\s+(?=[A-Z0-9\"“'(\[])|(?<=[.!?][\"”')\]])\s+(?=[A-Z0-9\"“'(\[])"
+MAX_SENTENCE_WORDS = 120
+_DOT = "\u2024"  # stand-in for a protected period while splitting
+
+
 def split_into_sentences(text):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sentences if s.strip()]
+    protected = re.sub(SENTENCE_ABBREVIATIONS, lambda m: m.group().replace(".", _DOT), text)
+    sentences = []
+    for sent in re.split(SENTENCE_BOUNDARY, protected):
+        words = sent.replace(_DOT, ".").split()
+        # A run-on with no punctuation would otherwise become one giant chunk.
+        for i in range(0, len(words), MAX_SENTENCE_WORDS):
+            sentences.append(" ".join(words[i:i + MAX_SENTENCE_WORDS]))
+    return sentences
 
 
-def chunk_by_sentences(text, target_words=150, overlap_sentences=2):
-    sentences = split_into_sentences(text)
+def chunk_by_sentences(text, target_words=150, overlap_sentences=2,
+                       max_overlap_words=50, min_tail_words=30):
+    """Group whole sentences into chunks of about target_words, repeating the
+    last sentences of each chunk at the start of the next."""
     chunks = []
-    current, word_count = [], 0
+    current, new_sentences = [], []
 
-    for sent in sentences:
+    def word_count(sentences):
+        return sum(len(s.split()) for s in sentences)
+
+    for sent in split_into_sentences(text):
         current.append(sent)
-        word_count += len(sent.split())
-        if word_count >= target_words:
+        new_sentences.append(sent)
+        if word_count(current) >= target_words:
             chunks.append(" ".join(current))
-            current = current[-overlap_sentences:] if overlap_sentences else []
-            word_count = sum(len(s.split()) for s in current)
+            overlap = current[-overlap_sentences:] if overlap_sentences else []
+            # A couple of long sentences shouldn't turn into half a chunk of repeats.
+            while overlap and word_count(overlap) > max_overlap_words:
+                overlap = overlap[1:]
+            current, new_sentences = overlap, []
 
-    if current:
-        chunks.append(" ".join(current))
+    # Only emit a tail if it holds something new: a tail of nothing but overlap
+    # would be a duplicate of the end of the previous chunk.
+    if new_sentences:
+        if chunks and word_count(new_sentences) < min_tail_words:
+            chunks[-1] += " " + " ".join(new_sentences)
+        else:
+            chunks.append(" ".join(current))
 
-    return [c for c in chunks if c.strip()]
+    return chunks
 
 
-def truncate_to_word_budget(text, max_words=220):
+def truncate_to_word_budget(text, max_words=300):
     """
-    Rough safety cap on context size. One word is roughly ~1.3 tokens for
-    English text, so 220 words keeps the context comfortably under ~300
-    tokens even in a worst case, leaving headroom in a 2048-token window for
-    the system prompt, question, and the model's own answer.
+    Cap on context size, kept well below what n_ctx would allow. Measured on the
+    Gemma 1B model: answers were good at up to ~475 prompt tokens (300 words), but
+    at 630-720 tokens (500 words) most turned to gibberish like "The context.
+    The context." Raising n_batch/n_ubatch made no difference, so it isn't a
+    batching problem. Re-test with a few real questions before raising this.
     """
     words = text.split()
     if len(words) <= max_words:
@@ -137,6 +276,9 @@ def extract_json(text):
 # Expanded corpus covering the categories users are most likely to ask about:
 # chronic diseases, common symptoms/acute conditions, medications, nutrition,
 # and mental health. Add/remove URLs here as you learn what your users ask about.
+# COVID-19, bone fractures and anaphylaxis are deliberately absent for now:
+# eval_questions.json uses them as out-of-scope tests (ids 26, 28, 29). If you add
+# them, update those entries too.
 
 wiki_urls = [
     # Chronic diseases
@@ -146,6 +288,9 @@ wiki_urls = [
     "https://en.wikipedia.org/wiki/Asthma",
     "https://en.wikipedia.org/wiki/Obesity",
     "https://en.wikipedia.org/wiki/Chronic_kidney_disease",
+    "https://en.wikipedia.org/wiki/Cardiovascular_disease",
+    "https://en.wikipedia.org/wiki/Stroke",
+    "https://en.wikipedia.org/wiki/Chronic_obstructive_pulmonary_disease",
 
     # Common symptoms / acute conditions
     "https://en.wikipedia.org/wiki/Common_cold",
@@ -153,23 +298,39 @@ wiki_urls = [
     "https://en.wikipedia.org/wiki/Migraine",
     "https://en.wikipedia.org/wiki/Fever",
     "https://en.wikipedia.org/wiki/Gastroenteritis",
+    "https://en.wikipedia.org/wiki/Headache",
+    "https://en.wikipedia.org/wiki/Cough",
+    "https://en.wikipedia.org/wiki/Low_back_pain",
+    "https://en.wikipedia.org/wiki/Allergy",
+    "https://en.wikipedia.org/wiki/Dehydration",
 
     # Medications
     "https://en.wikipedia.org/wiki/Paracetamol",
     "https://en.wikipedia.org/wiki/Ibuprofen",
     "https://en.wikipedia.org/wiki/Antibiotic",
     "https://en.wikipedia.org/wiki/Insulin_(medication)",
+    "https://en.wikipedia.org/wiki/Aspirin",
+    "https://en.wikipedia.org/wiki/Statin",
+    "https://en.wikipedia.org/wiki/Antidepressant",
 
     # Nutrition
     "https://en.wikipedia.org/wiki/Nutrition",
     "https://en.wikipedia.org/wiki/Vitamin_D",
     "https://en.wikipedia.org/wiki/Dietary_fiber",
+    "https://en.wikipedia.org/wiki/Healthy_diet",
+    "https://en.wikipedia.org/wiki/Carbohydrate",
+    "https://en.wikipedia.org/wiki/Detoxification_(alternative_medicine)",
+    "https://en.wikipedia.org/wiki/Exercise",
 
     # Mental health
     "https://en.wikipedia.org/wiki/Major_depressive_disorder",
     "https://en.wikipedia.org/wiki/Anxiety_disorder",
     "https://en.wikipedia.org/wiki/Sleep",
     "https://en.wikipedia.org/wiki/Stress_(biology)",
+    "https://en.wikipedia.org/wiki/Mental_disorder",
+    "https://en.wikipedia.org/wiki/Psychotherapy",
+    "https://en.wikipedia.org/wiki/Insomnia",
+    "https://en.wikipedia.org/wiki/Meditation",
 ]
 
 custom_sentences = [
@@ -179,90 +340,159 @@ custom_sentences = [
     "A diet rich in fruits and vegetables supports a healthy immune system.",
 ]
 
+CUSTOM_SOURCE = "custom_health_tips"
+CHUNK_PARAMS = {"target_words": 150, "overlap_sentences": 2}
+
+
 def get_sources_fingerprint():
-    """Hash of the current source list. If wiki_urls or custom_sentences change,
-    this hash changes too, which tells load_or_build_index() the cache is stale
-    and needs to be rebuilt instead of silently serving outdated content."""
-    raw = "|".join(wiki_urls) + "|" + "|".join(custom_sentences)
+    """Hash of everything that determines the index contents: the sources, the
+    embedding model, the chunking settings and the cleaning/chunking code itself.
+    Any change makes load_or_build_index() rebuild instead of silently serving
+    chunks produced by the old logic."""
+    pipeline_code = "".join(
+        inspect.getsource(fn)
+        for fn in (extract_article, clean_text, split_into_sentences, chunk_by_sentences, indexable_text)
+    )
+    raw = json.dumps([
+        wiki_urls, custom_sentences, EMBEDDING_MODEL, CHUNK_PARAMS, NOISE_SELECTORS,
+        sorted(SKIPPED_SECTIONS), SENTENCE_ABBREVIATIONS, SENTENCE_BOUNDARY,
+        MAX_SENTENCE_WORDS, pipeline_code,
+    ])
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def indexable_text(chunk):
+    """The text that gets embedded and keyword-indexed. Prefixing the article and
+    section tells search what a chunk is about even when its sentences only say
+    "it" or "this condition"; the LLM still sees just chunk["text"]."""
+    return " - ".join(p for p in (chunk["title"], chunk["section"], chunk["text"]) if p)
+
+
 def build_corpus():
-    """Scrape, clean, and chunk every source. Returns a list of
-    {"text": ..., "source": ...} dicts. This is only called when there's no
+    """Clean and chunk every source. Returns (chunks, failed_urls), where chunks
+    are {"text", "source", "title", "section"} dicts. Only called when there's no
     valid cache on disk."""
-    all_chunks = []
+    all_chunks, failed = [], []
 
     print("\n--- Building corpus (scraping + chunking) ---")
     for url in wiki_urls:
-        text = get_text_from_url(url)
-        if not text:
+        html = fetch_html(url)
+        article = extract_article(html) if html else None
+        if not article or not article["sections"]:
             print(f"[SKIP] {url} produced no usable text.")
+            failed.append(url)
             continue
-        chunks = chunk_by_sentences(text)
-        print(f"[OK] {url} -> {len(chunks)} chunks, {len(text.split())} words")
-        for chunk in chunks:
-            all_chunks.append({"text": chunk, "source": url})
+        title = article["title"] or url.rsplit("/", 1)[-1].replace("_", " ")
+        seen = set()
+        for section, text in article["sections"]:
+            # Chunks stop at section boundaries so one chunk doesn't mix, say,
+            # the end of "Treatment" with the start of "History".
+            for chunk in chunk_by_sentences(text, **CHUNK_PARAMS):
+                if chunk in seen or len(chunk.split()) < 12:
+                    continue
+                seen.add(chunk)
+                all_chunks.append({"text": chunk, "source": url, "title": title, "section": section})
+        print(f"[OK] {url} -> {len(seen)} chunks")
 
-    custom_text = " ".join(custom_sentences)
-    custom_chunks = chunk_by_sentences(custom_text, target_words=50, overlap_sentences=1)
-    print(f"[OK] custom_health_tips -> {len(custom_chunks)} chunks")
-    for chunk in custom_chunks:
-        all_chunks.append({"text": chunk, "source": "custom_health_tips"})
+    # One chunk per tip: they're unrelated to each other, so joining them would
+    # make every tip compete with the other three for the same embedding.
+    for sentence in custom_sentences:
+        all_chunks.append({"text": sentence, "source": CUSTOM_SOURCE, "title": "Health tips", "section": ""})
 
     print(f"--- Total chunks built: {len(all_chunks)} ---\n")
 
-    if len(all_chunks) <= len(custom_chunks):
+    if len(failed) == len(wiki_urls):
         print("*** WARNING: none of the Wikipedia URLs produced content. "
-              "Your corpus is effectively just the 4 custom sentences. "
-              "Check the [WARN]/[ERROR] messages above. ***\n")
+              f"Your corpus is effectively just the {len(custom_sentences)} custom sentences. "
+              "Check the [WARN] messages above. ***\n")
 
-    return all_chunks
+    return all_chunks, failed
+
+
+def read_manifest():
+    if not os.path.exists(MANIFEST_PATH):
+        return None
+    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_cached_index(manifest):
+    """Returns (index, chunks), or None if the files on disk are inconsistent,
+    which happens if an earlier build was interrupted part way through saving."""
+    if not (os.path.exists(INDEX_PATH) and os.path.exists(CHUNKS_PATH)):
+        return None
+    cached_index = faiss.read_index(INDEX_PATH)
+    with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+        cached_chunks = json.load(f)
+    if cached_index.ntotal != len(cached_chunks) or len(cached_chunks) != manifest.get("total_chunks"):
+        print("--- Cached files don't match each other — rebuilding index ---")
+        return None
+    print(f"--- Loaded {len(cached_chunks)} chunks from cache (built {manifest.get('built_at')}) ---\n")
+    return cached_index, cached_chunks
 
 
 def load_or_build_index():
     """Load the FAISS index + chunk metadata from disk if a valid cache exists
-    for the current source list; otherwise scrape/embed fresh and cache the
-    result so the next restart can skip straight to loading."""
+    for the current sources and pipeline; otherwise scrape/embed fresh and cache
+    the result so the next restart can skip straight to loading."""
     current_hash = get_sources_fingerprint()
+    manifest = read_manifest()
 
-    cache_valid = (
-        os.path.exists(INDEX_PATH)
-        and os.path.exists(CHUNKS_PATH)
-        and os.path.exists(SOURCES_HASH_PATH)
-    )
-
-    if cache_valid:
-        with open(SOURCES_HASH_PATH, "r") as f:
-            cached_hash = f.read().strip()
-        if cached_hash == current_hash:
-            print("--- Loading cached FAISS index and chunks from disk ---")
-            cached_index = faiss.read_index(INDEX_PATH)
-            with open(CHUNKS_PATH, "r") as f:
-                cached_chunks = json.load(f)
-            print(f"--- Loaded {len(cached_chunks)} chunks from cache ---\n")
-            return cached_index, cached_chunks
+    if manifest and manifest.get("fingerprint") == current_hash:
+        failed = manifest.get("failed_sources", [])
+        # A page that failed last time (say, a rate limit) shouldn't stay missing
+        # forever. Retry it, but if it still fails, the existing index is the
+        # best we have and re-embedding wouldn't change anything.
+        if not any([fetch_html(url) for url in failed]):
+            if failed:
+                print(f"*** WARNING: {len(failed)} sources are missing from the index: {failed} ***")
+            cached = load_cached_index(manifest)
+            if cached:
+                return cached
         else:
-            print("--- Source list changed since last run — rebuilding index ---")
+            print("--- A previously failed source is now available — rebuilding index ---")
+    elif manifest:
+        print("--- Sources or pipeline changed since last run — rebuilding index ---")
 
-    chunks = build_corpus()
-    chunk_texts = [c["text"] for c in chunks]
-    embeddings = embedder.encode(chunk_texts, normalize_embeddings=True)
+    chunks, failed = build_corpus()
+    embeddings = embedder.encode(
+        [indexable_text(c) for c in chunks], normalize_embeddings=True, show_progress_bar=True
+    )
     embeddings = np.array(embeddings).astype("float32")
 
     new_index = faiss.IndexFlatIP(embeddings.shape[1])
     new_index.add(embeddings)
 
-    # Persist to disk so the next startup can skip scraping + embedding entirely
+    # Persist to disk so the next startup can skip scraping + embedding entirely.
+    # The manifest goes last: it's what marks the other two files as complete.
     faiss.write_index(new_index, INDEX_PATH)
-    with open(CHUNKS_PATH, "w") as f:
+    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
         json.dump(chunks, f)
-    with open(SOURCES_HASH_PATH, "w") as f:
-        f.write(current_hash)
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump({
+            "fingerprint": current_hash,
+            "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "embedding_model": EMBEDDING_MODEL,
+            "total_chunks": len(chunks),
+            "failed_sources": failed,
+        }, f, indent=2)
 
-    print(f"--- Cached index + chunks to '{CACHE_DIR}/' for future restarts ---\n")
+    print(f"--- Cached index + chunks to '{CACHE_DIR}' for future restarts ---\n")
     return new_index, chunks
 
+
+# ----------- Force a cache rebuild -----------
+# Run `python app.py --rebuild` to wipe the cache and re-scrape everything from
+# scratch — useful if a source's content has changed on the web even though your
+# wiki_urls list hasn't, since the fingerprint alone wouldn't catch that.
+# This has to happen before the index loads so that BM25 below is built from the
+# new chunks. WERKZEUG_RUN_MAIN marks the debug reloader's child process, which
+# gets the same argv and would otherwise wipe and rebuild a second time.
+
+if "--rebuild" in sys.argv and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    shutil.rmtree(CACHE_DIR)
+    os.makedirs(HTML_DIR)
+    print("--- Cache cleared, rebuilding now ---")
 
 index, all_chunks = load_or_build_index()
 
@@ -272,7 +502,7 @@ index, all_chunks = load_or_build_index()
 # this separately.
 
 print("--- Building BM25 keyword index ---")
-tokenized_corpus = [tokenize(c["text"]) for c in all_chunks]
+tokenized_corpus = [tokenize(indexable_text(c)) for c in all_chunks]
 bm25 = BM25Okapi(tokenized_corpus)
 print(f"--- BM25 index built over {len(all_chunks)} chunks ---\n")
 
@@ -294,8 +524,14 @@ RELEVANCE_THRESHOLD = 0.15
 # winning over genuinely relevant chunks, raise it.
 SEMANTIC_WEIGHT = 0.6
 
+# How many chunks /ask passes to the LLM: about what fits in the context budget
+# (see truncate_to_word_budget), so every source shown was actually read by the
+# model. /debug and run_eval.py use the same value so the eval measures what users
+# actually get.
+TOP_K = 2
 
-def hybrid_search(question, k=3, candidate_pool=20):
+
+def hybrid_search(question, k=TOP_K, candidate_pool=20):
     """
     Combines semantic (embedding/FAISS) search with keyword (BM25) search.
 
@@ -364,26 +600,40 @@ def debug():
 
     results = [
         {
+            "rank": rank,
+            "used_by_ask": rank <= TOP_K,
             "combined_score": round(c["combined_score"], 4),
             "semantic_score": round(c["semantic_score"], 4),
             "bm25_score": round(c["bm25_score"], 4),
             "source": all_chunks[c["index"]]["source"],
+            "section": all_chunks[c["index"]]["section"],
             "text_preview": all_chunks[c["index"]]["text"][:200],
             "passes_current_threshold": c["combined_score"] >= RELEVANCE_THRESHOLD,
         }
-        for c in top_k
+        for rank, c in enumerate(top_k, start=1)
     ]
 
     return jsonify({
         "question": user_question,
         "total_chunks_in_index": len(all_chunks),
         "current_threshold": RELEVANCE_THRESHOLD,
+        "top_k": TOP_K,
         "semantic_weight": SEMANTIC_WEIGHT,
         "top_matches": results,
     })
 
 
 # ----------- API Endpoint -----------
+
+def unique_sources(chunks):
+    """Sources for the UI, best match first, each listed once. Custom tips have
+    no page to link to, so their url is None."""
+    sources = {}
+    for c in chunks:
+        url = None if c["source"] == CUSTOM_SOURCE else c["source"]
+        sources.setdefault(c["source"], {"title": c["title"], "url": url})
+    return list(sources.values())
+
 
 @app.route("/ask", methods=["POST"])
 def ask():
@@ -394,7 +644,7 @@ def ask():
         return jsonify({"error": "No question provided"}), 400
 
     try:
-        top_k, _ = hybrid_search(user_question, k=3, candidate_pool=20)
+        top_k, _ = hybrid_search(user_question, candidate_pool=20)
 
         retrieved = [
             (all_chunks[c["index"]], c["combined_score"])
@@ -414,11 +664,12 @@ def ask():
                 "evaluation": {
                     "relevance": None, "completeness": None, "fluency": None,
                     "overall": None, "feedback": "No relevant context retrieved"
-                }
+                },
+                "sources": [],
             })
 
-        context = "\n\n".join(f"[{c['source']}] {c['text']}" for c, _ in retrieved)
-        context = truncate_to_word_budget(context, max_words=220)
+        context = "\n\n".join(f"[{c['title']}] {c['text']}" for c, _ in retrieved)
+        context = truncate_to_word_budget(context)
 
         system_prompt = (
             "You are a helpful health assistant. Answer using ONLY the provided "
@@ -428,14 +679,16 @@ def ask():
         )
         user_prompt = f"Context:\n{context}\n\nQuestion:\n{user_question}"
 
-        response = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=400,
-            temperature=0.3,
-        )
+        with _llm_lock:
+            llm = get_llm()
+            response = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=400,
+                temperature=0.3,
+            )
 
         answer = response["choices"][0]["message"]["content"]
 
@@ -457,10 +710,11 @@ Return ONLY valid JSON:
 }}
 """
 
-        eval_response = llm.create_chat_completion(
-            messages=[{"role": "user", "content": eval_prompt}],
-            max_tokens=120,
-        )
+        with _llm_lock:
+            eval_response = llm.create_chat_completion(
+                messages=[{"role": "user", "content": eval_prompt}],
+                max_tokens=120,
+            )
 
         raw_eval = eval_response["choices"][0]["message"]["content"]
         evaluation = extract_json(raw_eval)
@@ -475,26 +729,12 @@ Return ONLY valid JSON:
             "question": user_question,
             "answer": answer,
             "evaluation": evaluation,
-            "sources": [c["source"] for c, _ in retrieved],
+            "sources": unique_sources(c for c, _ in retrieved),
         })
     except Exception as e:
         print(e)
         return jsonify({"error": str(e)}), 500
 
 
-# ----------- Force a cache rebuild -----------
-# Run `python health_chatbot.py --rebuild` to wipe the cache and re-scrape
-# everything from scratch — useful if a source's content has changed on the
-# web even though your wiki_urls list hasn't, since the hash check alone
-# wouldn't catch that.
-
 if __name__ == "__main__":
-    import sys
-    if "--rebuild" in sys.argv:
-        for path in [INDEX_PATH, CHUNKS_PATH, SOURCES_HASH_PATH]:
-            if os.path.exists(path):
-                os.remove(path)
-        print("--- Cache cleared, rebuilding now ---")
-        index, all_chunks = load_or_build_index()
-
     app.run(debug=True)

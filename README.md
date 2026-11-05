@@ -4,15 +4,31 @@
 # The installation procedures are
 
 1. Install node.js and npm latest version.
-   
-2. Create the react app npx create-react-app frontend cd frontend npm install axios
 
-3. npm start
+2. From the project root, run `npm install`, then `npm start`. If port 3000 is taken, use `PORT=3100 npm start`.
 
-4. Create a virtual environment within the backend folder
-    Use the command python3 -m venv <environment name> 
+3. Create a virtual environment within the backend folder
+    Use the command python3 -m venv <environment name>
     Move till the environment path and Use the command environment path/Scripts/Activate
 
-5. Run the command pip install flask flask-cors sentence-transformers faiss-cpu llama-cpp-python beautifulsoup4 requests
+4. Run the command pip install flask flask-cors sentence-transformers faiss-cpu llama-cpp-python beautifulsoup4 requests rank_bm25
 
-6. Run the command python app.py
+5. Run the command python app.py
+
+# Working with the knowledge base
+
+The first start downloads the articles in `wiki_urls` and builds the search index, which takes a few minutes. It is saved to `backend/rag_cache/`, so later starts load it straight away. It rebuilds automatically when the sources or the cleaning/chunking code change.
+
+To pick up edits made to the Wikipedia articles themselves, download everything again:
+
+    python app.py --rebuild
+
+# Measuring retrieval quality
+
+With the backend running, from the backend folder:
+
+    python run_eval.py
+
+This checks each question in `backend/eval_questions.json` against the chunks that `/ask` would give the model, and writes the details to `backend/eval_results.json`. To see the scores behind one question, POST `{"question": "..."}` to `http://localhost:5000/debug`.
+
+Each question lists the page that should answer it in `expected_source`, plus any other valid pages in `also_acceptable`. `expected_source: null` means the question should find nothing and trigger the fallback answer.

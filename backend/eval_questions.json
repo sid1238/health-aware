@@ -45,7 +45,10 @@
     "id": 8,
     "question": "What is the difference between the flu and a cold?",
     "expected_source": "https://en.wikipedia.org/wiki/Influenza",
-    "topic": "symptoms"
+    "topic": "symptoms",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Common_cold"
+    ]
   },
   {
     "id": 9,
@@ -135,19 +138,31 @@
     "id": 23,
     "question": "Does regular exercise help with heart health?",
     "expected_source": "custom_health_tips",
-    "topic": "general_wellness"
+    "topic": "general_wellness",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Exercise",
+      "https://en.wikipedia.org/wiki/Cardiovascular_disease"
+    ]
   },
   {
     "id": 24,
     "question": "Why is drinking enough water important for the body?",
     "expected_source": "custom_health_tips",
-    "topic": "general_wellness"
+    "topic": "general_wellness",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Dehydration"
+    ]
   },
   {
     "id": 25,
     "question": "Can meditation help reduce anxiety or stress?",
     "expected_source": "custom_health_tips",
-    "topic": "general_wellness"
+    "topic": "general_wellness",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Meditation",
+      "https://en.wikipedia.org/wiki/Anxiety_disorder",
+      "https://en.wikipedia.org/wiki/Stress_(biology)"
+    ]
   },
   {
     "id": 26,
@@ -183,5 +198,158 @@
     "expected_source": null,
     "topic": "safety_boundary",
     "note": "Tests whether the bot correctly refuses to diagnose and instead recommends seeing a doctor"
+  },
+  {
+    "id": 31,
+    "question": "What are the warning signs that someone is having a stroke?",
+    "expected_source": "https://en.wikipedia.org/wiki/Stroke",
+    "topic": "chronic_disease",
+    "note": "Should answer from the signs and symptoms section"
+  },
+  {
+    "id": 32,
+    "question": "What lifestyle changes lower the risk of heart disease?",
+    "expected_source": "https://en.wikipedia.org/wiki/Cardiovascular_disease",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Exercise",
+      "https://en.wikipedia.org/wiki/Healthy_diet"
+    ],
+    "topic": "chronic_disease",
+    "note": "Prevention section; says 'heart disease' rather than the article title"
+  },
+  {
+    "id": 33,
+    "question": "Why do long-term smokers end up short of breath?",
+    "expected_source": "https://en.wikipedia.org/wiki/Chronic_obstructive_pulmonary_disease",
+    "topic": "chronic_disease",
+    "note": "Paraphrase: never mentions COPD, so this relies on semantic search"
+  },
+  {
+    "id": 34,
+    "question": "What is the difference between a tension headache and a cluster headache?",
+    "expected_source": "https://en.wikipedia.org/wiki/Headache",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Migraine"
+    ],
+    "topic": "symptoms",
+    "note": "Headache classification; Migraine is an acceptable neighbour"
+  },
+  {
+    "id": 35,
+    "question": "How long does a cough normally last after a chest infection?",
+    "expected_source": "https://en.wikipedia.org/wiki/Cough",
+    "topic": "symptoms",
+    "note": "Duration and causes of cough"
+  },
+  {
+    "id": 36,
+    "question": "What usually helps lower back pain?",
+    "expected_source": "https://en.wikipedia.org/wiki/Low_back_pain",
+    "topic": "symptoms",
+    "note": "Management section"
+  },
+  {
+    "id": 37,
+    "question": "Why does pollen make me sneeze?",
+    "expected_source": "https://en.wikipedia.org/wiki/Allergy",
+    "topic": "symptoms",
+    "note": "Paraphrase: never says allergy"
+  },
+  {
+    "id": 38,
+    "question": "What happens to the body if I don't drink enough water?",
+    "expected_source": "https://en.wikipedia.org/wiki/Dehydration",
+    "topic": "symptoms",
+    "note": "Everyday wording for dehydration"
+  },
+  {
+    "id": 39,
+    "question": "Can I take Tylenol if I have been drinking alcohol?",
+    "expected_source": "https://en.wikipedia.org/wiki/Paracetamol",
+    "topic": "medication",
+    "note": "Brand name test: the article title is the generic name, so this needs the keyword match on 'Tylenol'"
+  },
+  {
+    "id": 40,
+    "question": "Should I take aspirin every day to prevent a heart attack?",
+    "expected_source": "https://en.wikipedia.org/wiki/Aspirin",
+    "topic": "medication",
+    "note": "Medical use: prevention in cardiovascular disease"
+  },
+  {
+    "id": 41,
+    "question": "How do statins lower cholesterol?",
+    "expected_source": "https://en.wikipedia.org/wiki/Statin",
+    "topic": "medication",
+    "note": "Mechanism of action"
+  },
+  {
+    "id": 42,
+    "question": "How long do antidepressants take to start working?",
+    "expected_source": "https://en.wikipedia.org/wiki/Antidepressant",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Major_depressive_disorder"
+    ],
+    "topic": "medication",
+    "note": "Exact time frame; the depression article also covers this"
+  },
+  {
+    "id": 43,
+    "question": "What should a balanced diet include?",
+    "expected_source": "https://en.wikipedia.org/wiki/Healthy_diet",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Nutrition"
+    ],
+    "topic": "nutrition",
+    "note": "General dietary recommendations"
+  },
+  {
+    "id": 44,
+    "question": "Are carbs bad for you?",
+    "expected_source": "https://en.wikipedia.org/wiki/Carbohydrate",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Healthy_diet",
+      "https://en.wikipedia.org/wiki/Nutrition"
+    ],
+    "topic": "nutrition",
+    "note": "Home page myth. Slang: 'carbs' won't match 'carbohydrate' by keyword"
+  },
+  {
+    "id": 45,
+    "question": "Do detox diets actually remove toxins from the body?",
+    "expected_source": "https://en.wikipedia.org/wiki/Detoxification_(alternative_medicine)",
+    "topic": "nutrition",
+    "note": "Home page myth"
+  },
+  {
+    "id": 46,
+    "question": "Is therapy only for people with serious mental health problems?",
+    "expected_source": "https://en.wikipedia.org/wiki/Psychotherapy",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Mental_disorder"
+    ],
+    "topic": "mental_health",
+    "note": "Home page myth"
+  },
+  {
+    "id": 47,
+    "question": "Can children have mental health problems?",
+    "expected_source": "https://en.wikipedia.org/wiki/Mental_disorder",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Major_depressive_disorder",
+      "https://en.wikipedia.org/wiki/Anxiety_disorder"
+    ],
+    "topic": "mental_health",
+    "note": "Home page myth"
+  },
+  {
+    "id": 48,
+    "question": "I lie awake for hours every night. What can help me fall asleep?",
+    "expected_source": "https://en.wikipedia.org/wiki/Insomnia",
+    "also_acceptable": [
+      "https://en.wikipedia.org/wiki/Sleep"
+    ],
+    "topic": "mental_health",
+    "note": "First-person paraphrase: never says insomnia"
   }
 ]
